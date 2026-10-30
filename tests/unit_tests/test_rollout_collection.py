@@ -6089,7 +6089,7 @@ class TestRolloutCollection:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, redact_payloads: bool
     ) -> None:
         from nemo_gym.base_responses_api_model import CaptureStore
-        from nemo_gym.config_types import ModelServerRef
+        from nemo_gym.config.config_types import ModelServerRef
         from nemo_gym.rollout_observability import ModelCallRef, TrajectoryRecord, TrajectoryTurn
 
         capture_dir = tmp_path / "captures"
@@ -6186,7 +6186,7 @@ class TestRolloutCollection:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from nemo_gym.base_responses_api_model import CaptureStore
-        from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+        from nemo_gym.config.global_config import ROLLOUT_ID_KEY_NAME
 
         capture_dir = tmp_path / "captures"
         monkeypatch.setattr(
