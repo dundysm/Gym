@@ -27,13 +27,13 @@ from unittest.mock import AsyncMock, MagicMock
 from pytest import fixture, mark, raises
 from tenacity import RetryError, wait_none
 
+from nemo_gym.client import ServerClient
 from nemo_gym.config import ModelServerRef, ResourcesServerRef
 from nemo_gym.core import (
     NeMoGymEasyInputMessage,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseOutputMessage,
 )
-from nemo_gym.server_utils import ServerClient
 from responses_api_agents.toolsandbox_agent.app import (
     ToolSandboxAgent,
     ToolSandboxAgentConfig,
@@ -275,7 +275,9 @@ class TestApp:
         assert len(self._calls_to(agent, "/v1/responses")) == 2
         assert response.id == "resp-final"
         # Usage covers every model call in the episode, not just the last one.
-        assert response.usage.model_dump() == usage(2118, 1424, cached=400, reasoning=1200)
+        expected_usage = usage(2118, 1424, cached=400, reasoning=1200)
+        expected_usage["input_tokens_details"]["cache_write_tokens"] = None
+        assert response.usage.model_dump() == expected_usage
 
     async def test_responses_no_actionable_output_breaks(self, agent_config: ToolSandboxAgentConfig) -> None:
         post = _post_router(

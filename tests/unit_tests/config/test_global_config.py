@@ -17,6 +17,7 @@ import importlib.metadata
 import sys
 from contextlib import nullcontext as does_not_raise
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, PropertyMock
 
 from omegaconf import DictConfig, OmegaConf
@@ -25,7 +26,7 @@ from pydantic import ValidationError
 from pytest import CaptureFixture, LogCaptureFixture, MonkeyPatch, fixture, mark, raises
 
 import nemo_gym.config.global_config
-import nemo_gym.server_utils
+import nemo_gym.server_runtime.base_server
 from nemo_gym import CACHE_DIR, NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, RESULTS_DIR, WORKING_DIR
 from nemo_gym.config.config_types import (
     AgentCompositionError,
@@ -46,11 +47,13 @@ from nemo_gym.config.config_types import (
     is_almost_server,
 )
 from nemo_gym.config.global_config import (
+    AGENT_SESSION_AGENT_TYPES,
     ALLOW_UNSUPPORTED_PAIRING_ENV_VAR_NAME,
     ALLOW_UNSUPPORTED_PAIRING_KEY_NAME,
     DEFAULT_HEAD_SERVER_PORT,
     NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
     USE_ABSOLUTE_IP,
+    UV_CACHE_DIR_KEY_NAME,
     UV_LOCK_TIMEOUT_KEY_NAME,
     GlobalConfigDictParser,
     GlobalConfigDictParserConfig,
@@ -61,7 +64,14 @@ from nemo_gym.config.global_config import (
     resolve_dataset_agent,
 )
 from nemo_gym.config.secret_utils import hide_secrets_in_overrides, recursively_hide_secrets
-from nemo_gym.rollout_collection import _environment_servers_by_agent
+from nemo_gym.rollouts.rollout_collection import _environment_servers_by_agent
+
+
+@fixture(autouse=True)
+def _no_exported_uv_cache_dir(monkeypatch: MonkeyPatch) -> None:
+    # An exported UV_CACHE_DIR (CI runners set one) takes precedence over the default
+    # cache_dir/uv, so the default-config expectations only hold without it.
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
 
 
 class TestGlobalConfig:
@@ -89,6 +99,7 @@ class TestGlobalConfig:
             "skip_venv_if_present": False,
             "dry_run": False,
             "server_spinup_timeout_seconds": 600,
+            "server_shutdown_timeout_seconds": 1,
             "model_endpoint_readiness_timeout_seconds": 600,
             "allow_openai_version_skew": False,
             "uv_cache_dir": str(CACHE_DIR.expanduser().resolve() / "uv"),
@@ -197,6 +208,28 @@ class TestGlobalConfig:
 
         assert config[UV_LOCK_TIMEOUT_KEY_NAME] == expected
         assert nemo_gym.config.global_config.environ["UV_LOCK_TIMEOUT"] == str(expected)
+
+    @mark.parametrize(
+        ("exported", "configured", "expected"),
+        [
+            ("/warm/uv", {"uv_cache_dir": "/configured/uv"}, "/configured/uv"),  # the config key wins over the export
+            ("/warm/uv", {}, "/warm/uv"),  # an exported cache directory survives
+            (None, {}, str(Path("/local/cache") / "uv")),  # otherwise the default under the cache root
+        ],
+    )
+    def test_uv_cache_dir_precedence(
+        self, monkeypatch: MonkeyPatch, exported: Optional[str], configured: dict, expected: str
+    ) -> None:
+        self._mock_versions_for_testing(monkeypatch)
+        monkeypatch.setattr(
+            nemo_gym.config.global_config, "environ", {} if exported is None else {"UV_CACHE_DIR": exported}
+        )
+        self._mock_parse_environment(monkeypatch, DictConfig({"cache_dir": "/local/cache", **configured}))
+
+        config = get_global_config_dict()
+
+        assert config[UV_CACHE_DIR_KEY_NAME] == expected
+        assert nemo_gym.config.global_config.environ["UV_CACHE_DIR"] == expected
 
     def test_null_uv_lock_timeout_leaves_the_environment_alone(self, monkeypatch: MonkeyPatch) -> None:
         self._mock_versions_for_testing(monkeypatch)
@@ -369,7 +402,7 @@ class TestGlobalConfig:
         omegaconf_load_mock.side_effect = lambda path: (
             DictConfig({}) if "env" not in str(path) else DictConfig({"extra_dot_env_key": 2})
         )
-        monkeypatch.setattr(nemo_gym.server_utils.OmegaConf, "load", omegaconf_load_mock)
+        monkeypatch.setattr(nemo_gym.server_runtime.base_server.OmegaConf, "load", omegaconf_load_mock)
 
         global_config_dict = get_global_config_dict()
         assert (
@@ -418,7 +451,7 @@ b: 2
         omegaconf_load_mock = MagicMock()
         original_load = OmegaConf.load
         omegaconf_load_mock.side_effect = lambda path: (DictConfig({}) if "env" in str(path) else original_load(path))
-        monkeypatch.setattr(nemo_gym.server_utils.OmegaConf, "load", omegaconf_load_mock)
+        monkeypatch.setattr(nemo_gym.server_runtime.base_server.OmegaConf, "load", omegaconf_load_mock)
 
         global_config_dict = get_global_config_dict()
         assert (
@@ -465,7 +498,7 @@ config_paths:
         omegaconf_load_mock = MagicMock()
         original_load = OmegaConf.load
         omegaconf_load_mock.side_effect = lambda path: (DictConfig({}) if "env" in str(path) else original_load(path))
-        monkeypatch.setattr(nemo_gym.server_utils.OmegaConf, "load", omegaconf_load_mock)
+        monkeypatch.setattr(nemo_gym.server_runtime.base_server.OmegaConf, "load", omegaconf_load_mock)
 
         get_global_config_dict()
 
@@ -511,7 +544,7 @@ config_paths:
                 return DictConfig({})
 
         omegaconf_load_mock.side_effect = omegaconf_load_mock_side_effect
-        monkeypatch.setattr(nemo_gym.server_utils.OmegaConf, "load", omegaconf_load_mock)
+        monkeypatch.setattr(nemo_gym.server_runtime.base_server.OmegaConf, "load", omegaconf_load_mock)
 
         global_config_dict = get_global_config_dict()
         assert (
@@ -555,7 +588,7 @@ config_paths:
         omegaconf_load_mock = MagicMock()
         original_load = OmegaConf.load
         omegaconf_load_mock.side_effect = lambda path: (DictConfig({}) if "env" in str(path) else original_load(path))
-        monkeypatch.setattr(nemo_gym.server_utils.OmegaConf, "load", omegaconf_load_mock)
+        monkeypatch.setattr(nemo_gym.server_runtime.base_server.OmegaConf, "load", omegaconf_load_mock)
 
     def test_get_global_config_dict_config_paths_later_sibling_wins(
         self, monkeypatch: MonkeyPatch, tmp_path: Path
@@ -2587,8 +2620,13 @@ class TestConfigLoadErrors:
 
         assert missing_path in str(error.value)
 
-    @mark.parametrize("resources_server", ["reasoning_gym", "tavily_search"])
-    def test_langchain_deepagents_configs_have_environment_servers(self, resources_server: str) -> None:
+    @mark.parametrize(
+        ("resources_server", "resources_instance"),
+        [("reasoning_gym", "reasoning_gym"), ("tavily_search", "tavily_search_resources_server")],
+    )
+    def test_langchain_deepagents_configs_have_environment_servers(
+        self, resources_server: str, resources_instance: str
+    ) -> None:
         agent_name = f"{resources_server}_langchain_deepagents_agent_model_server"
         config_path = (
             Path(__file__).resolve().parents[3]
@@ -2618,9 +2656,13 @@ class TestConfigLoadErrors:
             )
         )
 
-        environment = resolved[f"{agent_name}_environment_server"]["environment_servers"]["legacy_agent"]
+        environment = resolved[f"{agent_name}_environment_server"]["environment_servers"]["single_agent_turn_legacy"]
         assert environment["entrypoint"] == "app.py"
         assert environment["agent_server"] == {"type": "responses_api_agents", "name": agent_name}
+        # single_agent_turn_legacy requires the Resources Server it seeds and verifies against.
+        assert environment["resources_server"] == {"type": "resources_servers", "name": resources_instance}
+        # The deepagents graph runs only its own tools, so the session sends it no grant.
+        assert environment["resources_tool_transports"] == []
 
     def test_multi_agent_environment_server_satisfies_agent_routing(self) -> None:
         parser = GlobalConfigDictParser()
@@ -3429,6 +3471,138 @@ class TestComposeUnboundAgent:
         assert "max_steps" not in block
         assert OmegaConf.to_container(block["datasets"])[0]["num_repeats"] == 8
         assert "hermes_agent" not in resolved
+
+    def _session_environment_config(self, harness_type: str) -> DictConfig:
+        """The standard config with `harness_type` as the swap source and a single_agent_turn_legacy server."""
+        config = self._config()
+        config.pop(self.HARNESS_INSTANCE)
+        config[harness_type] = {
+            "responses_api_agents": {
+                harness_type: {
+                    "entrypoint": "app.py",
+                    "resources_server": {"type": "resources_servers", "name": "???"},
+                    "model_server": {"type": "responses_api_models", "name": "harness_model"},
+                }
+            }
+        }
+        config["gpqa_mcqa_environment_server"] = {
+            "environment_servers": {
+                "single_agent_turn_legacy": {
+                    "entrypoint": "app.py",
+                    "resources_server": {"type": "resources_servers", "name": "gpqa_mcqa_resources_server"},
+                    "agent_server": {"type": "responses_api_agents", "name": "gpqa_mcqa_simple_agent"},
+                    "resources_tool_transports": ["mcp"],
+                    "max_concurrent_episodes": 4,
+                    "queue_timeout_seconds": 60,
+                    "default_episode_timeout_seconds": 600,
+                    "cleanup_timeout_seconds": 30,
+                }
+            }
+        }
+        return config
+
+    @mark.parametrize("harness_type", ["opencode_sandboxed_agent", "non_executing_simple_agent"])
+    def test_swap_to_agent_without_sessions_falls_back_to_legacy_relay(self, harness_type: str) -> None:
+        config = self._session_environment_config(harness_type)
+
+        GlobalConfigDictParser().compose_unbound_agent(config)
+
+        servers = config["gpqa_mcqa_environment_server"]["environment_servers"]
+        assert list(servers) == ["legacy_agent"]
+        assert OmegaConf.to_container(servers["legacy_agent"]) == {
+            "entrypoint": "app.py",
+            "agent_server": {"type": "responses_api_agents", "name": f"gpqa_mcqa_{harness_type}"},
+        }
+
+    @mark.parametrize("harness_type", sorted(nemo_gym.config.global_config.HOST_RUN_SWAP_AGENT_TYPES))
+    def test_swap_to_host_run_template_keeps_legacy_relay(self, harness_type: str) -> None:
+        """A session agent whose swap template runs on the host, with no model_server as shipped, keeps the relay."""
+        config = self._session_environment_config(harness_type)
+        config[harness_type].responses_api_agents[harness_type].pop("model_server")
+
+        GlobalConfigDictParser().compose_unbound_agent(config)
+
+        servers = config["gpqa_mcqa_environment_server"]["environment_servers"]
+        assert harness_type in AGENT_SESSION_AGENT_TYPES
+        assert list(servers) == ["legacy_agent"]
+
+    def test_legacy_relay_keeps_the_servers_own_worker_settings(self) -> None:
+        config = self._session_environment_config("opencode_sandboxed_agent")
+        server = config["gpqa_mcqa_environment_server"]["environment_servers"]["single_agent_turn_legacy"]
+        server["num_workers"] = 4
+        server["uvicorn_reuse_port"] = True
+
+        GlobalConfigDictParser().compose_unbound_agent(config)
+
+        relay = config["gpqa_mcqa_environment_server"]["environment_servers"]["legacy_agent"]
+        assert relay["num_workers"] == 4
+        assert relay["uvicorn_reuse_port"] is True
+
+    @mark.parametrize(
+        ("harness_type", "transports"),
+        [
+            ("hermes_agent", ["mcp"]),
+            ("opencode_agent", ["mcp"]),
+            ("pool_agent", ["mcp"]),
+            ("langchain_deepagents_agent", ["direct_http"]),
+        ],
+    )
+    def test_swap_to_agent_with_sessions_keeps_single_agent_turn_legacy(
+        self, harness_type: str, transports: list[str]
+    ) -> None:
+        config = self._session_environment_config(harness_type)
+        config["gpqa_mcqa_environment_server"]["environment_servers"]["single_agent_turn_legacy"][
+            "resources_tool_transports"
+        ] = transports
+        server_before = OmegaConf.to_container(
+            config["gpqa_mcqa_environment_server"]["environment_servers"]["single_agent_turn_legacy"]
+        )
+
+        GlobalConfigDictParser().compose_unbound_agent(config)
+
+        servers = config["gpqa_mcqa_environment_server"]["environment_servers"]
+        assert list(servers) == ["single_agent_turn_legacy"]
+        server_before["agent_server"]["name"] = f"gpqa_mcqa_{harness_type}"
+        if harness_type == "langchain_deepagents_agent":
+            server_before["resources_tool_transports"] = []
+        assert OmegaConf.to_container(servers["single_agent_turn_legacy"]) == server_before
+
+    def test_agent_session_agent_types_match_the_agent_apps(self) -> None:
+        """Every agent app that implements session seeding is listed, and nothing else is."""
+        agents_root = Path(nemo_gym.config.global_config.__file__).parents[2] / "responses_api_agents"
+        # SimpleAgent subclasses can customize seeding through _new_session_state while inheriting the endpoint.
+        seed_hooks = ("def _seed_agent_session_state(", "def _new_session_state(")
+        implementing = {
+            app.parent.name
+            for app in agents_root.glob("*/app.py")
+            if any(hook in app.read_text(encoding="utf-8") for hook in seed_hooks)
+        }
+
+        assert implementing == AGENT_SESSION_AGENT_TYPES
+
+    def test_langgraph_swap_keeps_unrelated_session_tool_grants(self) -> None:
+        config = self._session_environment_config("langgraph_agent")
+        config.langgraph_agent.responses_api_agents.langgraph_agent.resources_server = None
+        config["independent_agent"] = {
+            "responses_api_agents": {"hermes_agent": {"entrypoint": "app.py", "resources_server": None}}
+        }
+        config["independent_environment"] = {
+            "environment_servers": {
+                "single_agent_turn_legacy": {
+                    "agent_server": {"type": "responses_api_agents", "name": "independent_agent"},
+                    "resources_tool_transports": ["mcp"],
+                }
+            }
+        }
+        independent_before = OmegaConf.to_container(config.independent_environment)
+
+        GlobalConfigDictParser().compose_unbound_agent(config, selected_agent="langgraph_agent")
+
+        environment = config.gpqa_mcqa_environment_server.environment_servers.single_agent_turn_legacy
+        assert environment.agent_server.name == "gpqa_mcqa_langgraph_agent"
+        assert environment.resources_tool_transports == []
+        assert OmegaConf.to_container(config.independent_environment) == independent_before
+        assert config.independent_agent.responses_api_agents.hermes_agent.resources_server is None
 
     def _cli_dict(self, config: dict) -> DictConfig:
         """A command line dict as Hydra hands it over: struct, so an undeclared key is an error."""

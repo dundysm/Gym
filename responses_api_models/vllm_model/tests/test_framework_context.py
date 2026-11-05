@@ -14,24 +14,22 @@ import pytest
 from aiohttp import ClientConnectorError, ClientOSError, ClientResponse, ClientResponseError, ServerDisconnectedError
 from fastapi.testclient import TestClient
 
-import nemo_gym.base_responses_api_model
-import nemo_gym.server_utils
-from nemo_gym._checkpoint.control import CheckpointRequest
-from nemo_gym.base_responses_api_model import _CaptureMiddleware, _reconstruct_streamed_response
-from nemo_gym.chat_streaming import SSE_KEEPALIVE
-from nemo_gym.core import NeMoGymResponseCreateParamsNonStreaming, current_rollout_id
-from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
-from nemo_gym.responses_streaming import is_responses_lifecycle_chunk
-from nemo_gym.server_utils import ServerClient
-from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
-from nemo_gym.token_id_capture.sink import NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
-from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
-from nemo_gym.token_id_capture.staging.records import (
+import nemo_gym.client.server_client
+import nemo_gym.models.base_responses_api_model
+import nemo_gym.server_runtime.base_server
+from nemo_gym.client import NeMoGymAsyncOpenAI, ServerClient
+from nemo_gym.core import SSE_KEEPALIVE, NeMoGymResponseCreateParamsNonStreaming, current_rollout_id
+from nemo_gym.models import is_responses_lifecycle_chunk
+from nemo_gym.models.model_call_capture import _CaptureMiddleware, _reconstruct_streamed_response
+from nemo_gym.models.token_capture import CAPTURE_REFUSAL_HEADER, NG_CAPTURE_FIELD, NG_COMMIT_COORDS_FIELD
+from nemo_gym.models.token_capture.staging import (
     INVALID_COMMIT_COORDS_REASON,
     CaptureAdmission,
     RolloutManifest,
+    RolloutTokenCapture,
     StageResult,
 )
+from nemo_gym.server_runtime import CheckpointRequest
 from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
 from responses_api_models.vllm_model.tests.test_external_capture_streaming import _request
 
@@ -89,6 +87,7 @@ def make_capture_harness(
     decide_input=None,
     parent_resolution_mode="source_history",
     checkpoint=False,
+    stream_keepalive_s=None,
 ):
     """Allow paired RL tests to inject their staging transport and prefix reader."""
     sink = sink if sink is not None else MemoryStagingSink()
@@ -100,14 +99,14 @@ def make_capture_harness(
             "external_staging": True,
             "parent_resolution": parent_resolution_mode,
             "rebuild_response": False,
-            "lineage_store": "nemo_gym.token_id_capture.lineage:FileLineageStore",
+            "lineage_store": "nemo_gym.models.token_capture.lineage:FileLineageStore",
             "lineage_store_kwargs": {"root": str(tmp_path / "lineage")},
         }
     }
     if checkpoint:
         config["checkpoint"] = {"enabled": True, "control_auth_token": "test-control"}
     monkeypatch.setenv("NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN", "test-control")
-    monkeypatch.setattr(nemo_gym.server_utils, "get_global_config_dict", lambda: config)
+    monkeypatch.setattr(nemo_gym.client.server_client, "get_global_config_dict", lambda: config)
     model = VLLMModel(
         config=model_config
         or VLLMModelConfig(
@@ -121,6 +120,7 @@ def make_capture_harness(
             return_token_id_information=False,
             uses_reasoning_parser=reasoning,
             checkpoint={"policy": checkpoint},
+            stream_keepalive_s=stream_keepalive_s,
         ),
         server_client=MagicMock(spec=ServerClient, global_config_dict=config),
     )
@@ -194,7 +194,7 @@ def make_capture_harness(
                 response.read.side_effect = failure
             return response
 
-        monkeypatch.setattr(nemo_gym.server_utils, "get_global_aiohttp_client", lambda: MagicMock(request=send))
+        monkeypatch.setattr("nemo_gym.client.http_client.get_global_aiohttp_client", lambda: MagicMock(request=send))
         return await create_chat_completion(client, _resend_after_disconnect=_resend_after_disconnect, **body)
 
     monkeypatch.setattr(
@@ -231,7 +231,7 @@ def test_measurement_uses_same_candidate_without_ledger_writes(monkeypatch, tmp_
     calls = []
 
     async def tokenize(client, **body):
-        assert client.max_http_attempts == nemo_gym.server_utils.MAX_NUM_TRIES
+        assert client.max_http_attempts == nemo_gym.client.http_client.MAX_NUM_TRIES
         calls.append(body)
         return {"prompt_token_count": 19, "ng_context_measured": True}
 
@@ -743,6 +743,36 @@ async def test_checkpoint_gate_delivers_framework_capture(monkeypatch, tmp_path,
     assert not harness.client.app.state.nemo_gym_policy_gate.tickets
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
+async def test_keepalive_stream_announces_the_id_its_capture_row_records(monkeypatch, tmp_path, checkpoint):
+    # The ledger row's response_id is the join key for terminal attribution, and a keepalive stream
+    # announces its id before the engine answers, so the two must agree.
+    harness = make_capture_harness(monkeypatch, tmp_path, checkpoint=checkpoint, stream_keepalive_s=0.02)
+    worker = NeMoGymAsyncOpenAI.create_chat_completion
+
+    async def slow_worker(client, **body):
+        await asyncio.sleep(0.2)  # Outlasts several keepalive intervals.
+        return await worker(client, **body)
+
+    monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", slow_worker)
+    messages = await _request(
+        harness.client.app,
+        "/ng-rollout/attempt/training-token-capture/v1/responses",
+        {"input": HISTORY, "stream": True},
+    )
+    assert messages[0]["status"] == 200
+    raw = b"".join(message.get("body", b"") for message in messages)
+    events = [json.loads(line[len("data: ") :]) for line in raw.decode().splitlines() if line.startswith("data: ")]
+    assert [event["type"] for event in events[:2]] == ["response.created", "response.in_progress"]
+    assert events[-1]["type"] == "response.completed"
+    manifest = RolloutManifest.model_validate(await harness.ledger.manifest("attempt"))
+    assert len(manifest.records) == len(harness.sink.records) == 1
+    assert {event["response"]["id"] for event in events if "response" in event} == {manifest.records[0].response_id}
+    assert not manifest.pending_call_ids and not manifest.failures
+    if checkpoint:
+        assert not harness.client.app.state.nemo_gym_policy_gate.tickets
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("dialect", ["responses", "chat/completions"])
@@ -1014,7 +1044,7 @@ async def test_streaming_chat_continuation_commits_before_answer(monkeypatch, tm
     worker = NeMoGymAsyncOpenAI.create_chat_completion
     live = asyncio.Event()
     if keepalive:
-        monkeypatch.setattr(nemo_gym.base_responses_api_model, "_CHAT_KEEPALIVE_SECONDS", 0.001)
+        monkeypatch.setattr(nemo_gym.models.base_responses_api_model, "_CHAT_KEEPALIVE_SECONDS", 0.001)
 
     async def generate(client, **body):
         assert body["stream"] is False and "stream_options" not in body
@@ -1089,7 +1119,7 @@ async def test_cancelled_chat_keepalive_retains_uncertain_capture(monkeypatch, t
     worker = NeMoGymAsyncOpenAI.create_chat_completion
     live, staged, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     sent = []
-    monkeypatch.setattr(nemo_gym.base_responses_api_model, "_CHAT_KEEPALIVE_SECONDS", 0.001)
+    monkeypatch.setattr(nemo_gym.models.base_responses_api_model, "_CHAT_KEEPALIVE_SECONDS", 0.001)
 
     async def held_worker(client, **body):
         await worker(client, **body)
@@ -1196,7 +1226,7 @@ def test_capture_transport_retries_only_before_connection(monkeypatch, tmp_path,
         payload_body = json.loads(kwargs["data"])
         assert "_resend_after_disconnect" not in payload_body
         if failure.startswith("connect_exhausted") or failure == "connect" and len(wire_calls) == 1:
-            if len(wire_calls) > nemo_gym.server_utils.MAX_NUM_TRIES:
+            if len(wire_calls) > nemo_gym.client.http_client.MAX_NUM_TRIES:
                 raise RuntimeError("connection retry limit was not applied")
             raise refused
         if failure in ("429", "503", "503_after_stage", "quota", "auth") and len(wire_calls) == 1:
@@ -1227,8 +1257,8 @@ def test_capture_transport_retries_only_before_connection(monkeypatch, tmp_path,
         return response
 
     monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", real_generate)
-    monkeypatch.setattr(nemo_gym.server_utils, "get_global_aiohttp_client", lambda: MagicMock(request=send))
-    monkeypatch.setattr(nemo_gym.server_utils.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr("nemo_gym.client.http_client.get_global_aiohttp_client", lambda: MagicMock(request=send))
+    monkeypatch.setattr(nemo_gym.server_runtime.base_server.asyncio, "sleep", AsyncMock())
     response = harness.post("attempt", HISTORY)
     if failure == "connect":
         assert_clean(response)
@@ -1244,9 +1274,10 @@ def test_capture_transport_retries_only_before_connection(monkeypatch, tmp_path,
                 response.status_code
                 == {"429": 429, "503": 503, "503_after_stage": 503, "quota": 429, "auth": 401}[failure]
             )
-        expected_calls = {"connect_exhausted": nemo_gym.server_utils.MAX_NUM_TRIES, "connect_exhausted_custom": 2}.get(
-            failure, 1
-        )
+        expected_calls = {
+            "connect_exhausted": nemo_gym.client.http_client.MAX_NUM_TRIES,
+            "connect_exhausted_custom": 2,
+        }.get(failure, 1)
         assert len(wire_calls) == expected_calls
         manifest = harness.manifest("attempt")
         assert not manifest.records and len(manifest.pending_call_ids) == len(manifest.failures) == 1
@@ -1254,7 +1285,7 @@ def test_capture_transport_retries_only_before_connection(monkeypatch, tmp_path,
     if failure in ("quota", "auth"):
         assert harness.post("attempt", HISTORY).status_code != 200
         assert len(wire_calls) == 1  # The cached client remembers a permanent endpoint failure.
-    assert harness.model._clients[0].max_http_attempts == nemo_gym.server_utils.MAX_NUM_TRIES
+    assert harness.model._clients[0].max_http_attempts == nemo_gym.client.http_client.MAX_NUM_TRIES
 
 
 def test_closed_capture_refuses_dispatch_without_poisoning(monkeypatch, tmp_path):
