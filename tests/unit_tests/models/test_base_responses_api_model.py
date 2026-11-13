@@ -1415,7 +1415,10 @@ def _chat_stream_chunks():
 def test_reconstruct_chat_sse_keeps_each_choice_apart_by_its_index():
     from nemo_gym.models.model_call_capture import _reconstruct_streamed_response
 
-    raw = b"".join(_sse("", chunk) for chunk in _chat_stream_chunks()) + b"data: [DONE]\n\n"
+    chunks = _chat_stream_chunks()
+    chunks[2]["choices"][0].update(stop_reason=0, native_finish_reason="tool_use")
+    chunks[2]["choices"][1].update(stop_reason="end_turn", native_finish_reason="stop")
+    raw = b"".join(_sse("", chunk) for chunk in chunks) + b"data: [DONE]\n\n"
 
     resp = _reconstruct_streamed_response(raw, "chat")
 
@@ -1429,6 +1432,9 @@ def test_reconstruct_chat_sse_keeps_each_choice_apart_by_its_index():
         {"id": "t1", "type": "function", "function": {"name": "f1", "arguments": '{"x":2}'}}
     ]
     assert [choice["finish_reason"] for choice in resp["choices"]] == ["tool_calls", "stop"]
+    assert [choice["stop_reason"] for choice in resp["choices"]] == [0, "end_turn"]
+    assert type(resp["choices"][0]["stop_reason"]) is int
+    assert [choice["native_finish_reason"] for choice in resp["choices"]] == ["tool_use", "stop"]
     assert resp["id"] == "chatcmpl-n2" and resp["usage"]["total_tokens"] == 8
 
 
